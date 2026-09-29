@@ -1,0 +1,10 @@
+# VRLeft input access (T1 mini keyboard, VID 1189 PID 8890)
+#
+# Gives the monitor daemon read access to the keypad's input event node so it
+# can fire VRChat OSC messages from the six keys and the knob.
+#
+# Scoped to this vendor/product pair only. MODE=0666 is intentional so the
+# tool works without a re-login or group change; see README "Security notes".
+# Shift+1..0 on *your* keyboards needs no rule - log in with a session that
+# can read /dev/input/event* (distros usually grant this to the "input" group).
+SUBSYSTEM=="input", ATTRS{idVendor}=="1189", ATTRS{idProduct}=="8890", MODE="0666", GROUP="input", TAG+="uaccess"

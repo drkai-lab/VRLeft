@@ -1,0 +1,20 @@
+line-length = 100
+target-version = "py39"
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "UP",     # pyupgrade
+    "B",      # bugbear
+    "C4",     # comprehensions
+    "SIM",    # simplify
+    "EXE",    # executable issues
+    "ARG",    # unused arguments
+    "RUF",    # ruff-specific
+]
+ignore = []
+
+[lint.per-file-ignores]
+"tests/*" = ["ARG"]  # test doubles deliberately ignore their arguments

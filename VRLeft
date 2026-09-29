@@ -1,0 +1,1977 @@
+#!/usr/bin/env python3
+"""VRLeft (ぶいあーるれふと) - keypad to VRChat OSC bridge.
+
+VRLeft sends VRChat OSC messages when a key is pressed:
+
+* keys of the T1 mini keyboard (6 Keys 1 Knob RGB macro keypad, USB 1189:8890)
+* Shift+1..0 on any keyboard, so the keypad is optional
+
+Bindings are edited in a Tkinter GUI and stored as JSON. Single-file Python
+application: standard library + Tkinter only, no runtime dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import glob
+import io
+import json
+import os
+import queue
+import re
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+IS_LINUX = sys.platform.startswith("linux")
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+VERSION = "1.0.0"
+APP_NAME = "VRLeft"
+VID, PID = 0x1189, 0x8890  # T1 mini keyboard
+
+# Frozen windowed builds start with stdout/stderr set to None.
+for _stream in ("stdout", "stderr"):
+    if getattr(sys, _stream, None) is None:
+        setattr(sys, _stream, io.StringIO())
+del _stream
+
+
+class DeviceError(RuntimeError):
+    """The input backend could not be opened."""
+
+
+if IS_WIN:
+    _root = os.environ.get("APPDATA") or os.path.expanduser("~")
+    CONFIG_DIR = os.path.join(_root, APP_NAME)
+    STATE_DIR = os.path.join(_root, APP_NAME, "state")
+elif IS_MAC:
+    _root = os.path.expanduser("~/Library/Application Support")
+    CONFIG_DIR = os.path.join(_root, APP_NAME)
+    STATE_DIR = os.path.join(_root, APP_NAME, "state")
+else:
+    CONFIG_DIR = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        APP_NAME.lower())
+    STATE_DIR = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        APP_NAME.lower())
+
+CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+LOG_FILE = os.path.join(STATE_DIR, "monitor.log")
+INPUT_CODES = "/usr/include/linux/input-event-codes.h"
+
+
+def pid_file_path():
+    return os.path.join(STATE_DIR, "monitor.pid")
+
+
+def write_pid_file():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(pid_file_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def remove_pid_file():
+    try:
+        os.remove(pid_file_path())
+    except OSError:
+        pass
+
+
+def log(message):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), message)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(line, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# OSC (encode / decode / send / receive)
+# ---------------------------------------------------------------------------
+
+def _pad(data):
+    return data + b"\0" * (-len(data) % 4)
+
+
+def osc_encode(address, osc_type, value):
+    """Encode a single-value VRChat OSC message."""
+    if not isinstance(address, str) or not address.startswith("/"):
+        raise ValueError("OSC address must start with /")
+    out = _pad(address.encode("utf-8") + b"\0")
+    if osc_type == "bool":
+        out += _pad(b"," + (b"T" if value else b"F") + b"\0")
+    elif osc_type == "int":
+        out += _pad(b",i\0") + struct.pack(">i", int(value))
+    elif osc_type == "float":
+        out += _pad(b",f\0") + struct.pack(">f", float(value))
+    elif osc_type == "string":
+        out += _pad(b",s\0") + _pad(str(value).encode("utf-8") + b"\0")
+    else:
+        raise ValueError("unsupported OSC type: %r" % (osc_type,))
+    return out
+
+
+def _read_padded(data, offset):
+    end = data.find(b"\0", offset)
+    if end < 0:
+        raise ValueError("unterminated string in OSC message")
+    text = data[offset:end]
+    offset = end + 1
+    offset += -offset % 4
+    return text, offset
+
+
+def osc_decode(data):
+    """Decode an OSC message -> (address, [(typetag, value), ...])."""
+    if not data or not data.startswith(b"/"):
+        raise ValueError("not an OSC message")
+    address, offset = _read_padded(data, 0)
+    tags, offset = _read_padded(data, offset)
+    if not tags.startswith(b","):
+        raise ValueError("OSC typetags must start with ,")
+    values = []
+    for tag in tags[1:].decode("ascii", "replace"):
+        if tag == "T":
+            values.append(("T", True))
+        elif tag == "F":
+            values.append(("F", False))
+        elif tag == "N":
+            values.append(("N", None))
+        elif tag == "i":
+            values.append(("i", struct.unpack_from(">i", data, offset)[0]))
+            offset += 4
+        elif tag == "f":
+            values.append(("f", struct.unpack_from(">f", data, offset)[0]))
+            offset += 4
+        elif tag == "s":
+            text, offset = _read_padded(data, offset)
+            values.append(("s", text.decode("utf-8", "replace")))
+        elif tag == "\0":
+            break
+        else:
+            raise ValueError("unsupported OSC typetag: %r" % tag)
+    return address.decode("utf-8", "replace"), values
+
+
+class OscSender:
+    """Fire-and-forget UDP sender."""
+
+    def __init__(self, host="127.0.0.1", port=9000):
+        self.host = host
+        self.port = int(port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sent = 0
+        self.last_error = None
+
+    def configure(self, host, port):
+        self.host = host
+        self.port = int(port)
+
+    def send(self, address, osc_type, value):
+        try:
+            self._sock.sendto(
+                osc_encode(address, osc_type, value), (self.host, self.port))
+            self.sent += 1
+            self.last_error = None
+            return True
+        except (OSError, ValueError, struct.error) as exc:
+            self.last_error = str(exc)
+            return False
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+class OscListener(threading.Thread):
+    """Receives VRChat OSC messages (default: 127.0.0.1:9001)."""
+
+    def __init__(self, port, callback):
+        super().__init__(daemon=True)
+        self.port = int(port)
+        self.callback = callback
+        self.error = None
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.settimeout(0.3)
+        try:
+            self._sock.bind(("", self.port))
+        except OSError as exc:
+            self.error = str(exc)
+            self._sock.close()
+
+    def run(self):
+        if getattr(self._sock, "fileno", lambda: -1)() < 0:
+            return
+        while not self._stop.is_set():
+            try:
+                data, _addr = self._sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                address, values = osc_decode(data)
+            except ValueError:
+                continue
+            try:
+                self.callback(address, values)
+            except Exception:
+                pass
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+
+SHIFT_CODES = (42, 54)  # KEY_LEFTSHIFT / KEY_RIGHTSHIFT
+DIGIT_CODES = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5,
+               7: 6, 8: 7, 9: 8, 10: 9, 11: 0}
+OSC_TYPES = ("bool", "int", "float", "string")
+MODES = ("pulse", "toggle", "hold", "set")
+
+
+def default_settings():
+    bindings = []
+    number = 1
+    for digit in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0):
+        bindings.append({
+            "id": number,
+            "enabled": False,
+            "trigger": {"kind": "shift_digit", "digit": digit},
+            "action": {
+                "address": "", "type": "bool", "value": True,
+                "off_value": False, "mode": "pulse", "pulse_ms": 200,
+            },
+        })
+        number += 1
+    return {
+        "osc": {"host": "127.0.0.1", "port": 9000,
+                "listen": True, "listen_port": 9001},
+        "input": {"scope": "all", "shift_digits": True},
+        "bindings": bindings,
+    }
+
+
+def load_settings():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return default_settings()
+    if not isinstance(data, dict):
+        return default_settings()
+    settings = default_settings()
+    for section in ("osc", "input"):
+        incoming = data.get(section)
+        if isinstance(incoming, dict):
+            settings[section].update(incoming)
+    if isinstance(data.get("bindings"), list):
+        settings["bindings"] = data["bindings"]
+    return settings
+
+
+def save_settings(settings):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, CONFIG_FILE)
+
+
+def next_binding_id(settings):
+    ids = [b.get("id", 0) for b in settings.get("bindings", [])]
+    return max(ids + [0]) + 1
+
+
+def find_binding(settings, binding_id):
+    for binding in settings.get("bindings", []):
+        if binding.get("id") == binding_id:
+            return binding
+    return None
+
+
+def new_binding(settings, trigger):
+    binding = {
+        "id": next_binding_id(settings),
+        "enabled": True,
+        "trigger": trigger,
+        "action": {
+            "address": "/avatar/parameters/", "type": "bool", "value": True,
+            "off_value": False, "mode": "pulse", "pulse_ms": 200,
+        },
+    }
+    settings.setdefault("bindings", []).append(binding)
+    return binding
+
+
+def binding_label(binding):
+    trigger = binding.get("trigger", {})
+    if trigger.get("kind") == "shift_digit":
+        return "Shift+%s" % trigger.get("digit")
+    code = int(trigger.get("code", 0))
+    name = EVDEV_KEY_NAMES.get((EV_KEY, code))
+    if name is None:
+        name = "0x%03x" % code
+    device = trigger.get("device", "t1")
+    return "%s%s" % (name, "" if device == "t1" else " (any)")
+
+_MAC_LIBS = {}
+
+
+def _mac():
+    """Load IOKit / CoreFoundation and declare prototypes (macOS only)."""
+    if _MAC_LIBS:
+        return _MAC_LIBS
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    iohid = ctypes.CDLL(
+        "/System/Library/Frameworks/IOKit.framework/IOKit")
+
+    cfp, cfl = ctypes.c_void_p, ctypes.c_long
+    cf.CFRelease.argtypes = [cfp]
+    cf.CFStringCreateWithCString.restype = cfp
+    cf.CFStringCreateWithCString.argtypes = [cfp, ctypes.c_char_p, cfl]
+    cf.CFDictionaryCreate.restype = cfp
+    cf.CFDictionaryCreate.argtypes = [
+        cfp, ctypes.POINTER(cfp), ctypes.POINTER(cfp), cfl, cfp, cfp]
+    cf.CFSetGetValues.argtypes = [cfp, ctypes.POINTER(cfp)]
+    cf.CFSetGetCount.argtypes = [cfp]
+    cf.CFSetGetCount.restype = cfl
+    iohid.IOHIDManagerCreate.restype = cfp
+    iohid.IOHIDManagerCreate.argtypes = [cfp, cfl]
+    iohid.IOHIDManagerSetDeviceMatching.argtypes = [cfp, cfp]
+    iohid.IOHIDManagerOpen.argtypes = [cfp, cfl]
+    iohid.IOHIDManagerCopyDevices.restype = cfp
+    iohid.IOHIDManagerCopyDevices.argtypes = [cfp]
+    iohid.IOHIDDeviceOpen.argtypes = [cfp, cfl]
+    iohid.IOHIDDeviceSetReport.argtypes = [
+        cfp, cfl, cfl, ctypes.c_void_p, cfl]
+    iohid.IOHIDDeviceSetReport.restype = cfl
+    iohid.IOHIDDeviceCopyMatchingElements.restype = cfp
+    iohid.IOHIDDeviceCopyMatchingElements.argtypes = [cfp, cfp, cfl]
+    iohid.IOHIDElementGetReportID.argtypes = [cfp]
+    iohid.IOHIDElementGetReportID.restype = cfl
+    iohid.IOHIDElementGetType.argtypes = [cfp]
+    iohid.IOHIDElementGetType.restype = cfl
+    iohid.IOHIDElementGetReportSize.argtypes = [cfp]
+    iohid.IOHIDElementGetReportSize.restype = cfl
+    cf.CFRunLoopGetCurrent.argtypes = []
+    cf.CFRunLoopGetCurrent.restype = cfp
+    cf.CFRunLoopRunInMode.argtypes = [cfp, ctypes.c_double, ctypes.c_int]
+    cf.CFRunLoopRunInMode.restype = cfl
+    cf.CFNumberGetValue.argtypes = [cfp, cfl, ctypes.c_void_p]
+    cf.CFNumberGetValue.restype = ctypes.c_int
+    iohid.IOHIDManagerScheduleWithRunLoop.argtypes = [cfp, cfp, cfp]
+    iohid.IOHIDManagerRegisterInputValueCallback.argtypes = [cfp, cfp, cfp]
+    iohid.IOHIDManagerOpen.restype = cfl
+    iohid.IOHIDDeviceGetProperty.argtypes = [cfp, cfp]
+    iohid.IOHIDDeviceGetProperty.restype = cfp
+
+    _MAC_LIBS.update({"cf": cf, "iohid": iohid})
+    return _MAC_LIBS
+
+
+def _cf_string(text):
+    libs = _mac()
+    return libs["cf"].CFStringCreateWithCString(
+        None, text.encode("utf-8"), 0x08000100)
+
+
+def _cf_dict(pairs):
+    """Small CFDictionary with CFType callbacks (resolved from the library)."""
+    libs = _mac()
+    cf = libs["cf"]
+    keys = (ctypes.c_void_p * len(pairs))()
+    values = (ctypes.c_void_p * len(pairs))()
+    for index, (key, value) in enumerate(pairs):
+        keys[index] = _cf_string(key)
+        values[index] = _cf_string(value)
+    key_cb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
+    val_cb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
+    return cf.CFDictionaryCreate(
+        None, keys, values, len(pairs),
+        ctypes.addressof(key_cb), ctypes.addressof(val_cb))
+
+
+def _cf_release(ref):
+    if ref:
+        try:
+            _mac()["cf"].CFRelease(ref)
+        except Exception:
+            pass
+
+EV_SYN, EV_KEY, EV_REL = 0x1, 0x2, 0x3
+INPUT_EVENT = struct.Struct("llHHi")
+
+def list_input_nodes(only_t1=False):
+    """Every readable /dev/input/event* node, with its T1 flag."""
+    nodes = []
+    for uevent in glob.glob("/sys/class/input/event*/device/uevent"):
+        try:
+            text = open(uevent, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        product = ""
+        name = ""
+        for line in text.splitlines():
+            if line.startswith("PRODUCT="):
+                product = line.split("=", 1)[1].strip()
+            elif line.startswith("NAME="):
+                name = line.split("=", 1)[1].strip().strip('"')
+        parts = product.split("/")
+        is_t1 = False
+        if len(parts) >= 3:
+            try:
+                is_t1 = int(parts[1], 16) == VID and int(parts[2], 16) == PID
+            except ValueError:
+                is_t1 = False
+        if only_t1 and not is_t1:
+            continue
+        event = "/dev/input/" + os.path.basename(
+            os.path.dirname(os.path.dirname(uevent)))
+        nodes.append((event, name, is_t1))
+    nodes.sort()
+    return nodes
+
+
+def open_input_nodes(only_t1=False):
+    fds = []
+    for path, _name, is_t1 in list_input_nodes(only_t1=only_t1):
+        try:
+            flags = os.O_RDONLY | os.O_NONBLOCK
+            fds.append((os.open(path, flags), path, is_t1))
+        except OSError:
+            continue
+    return fds
+
+
+def read_events(fd):
+    out = []
+    while True:
+        try:
+            raw = os.read(fd, INPUT_EVENT.size)
+        except BlockingIOError:
+            break
+        except OSError:
+            break
+        if len(raw) < INPUT_EVENT.size:
+            break
+        _sec, _usec, etype, code, value = INPUT_EVENT.unpack(raw)
+        out.append((etype, code, value))
+    return out
+
+
+# -- normalised key tables (settings stay portable between the OSes) --------
+
+def _vk_to_evdev():
+    table = {
+        0x08: 14, 0x09: 15, 0x0D: 28, 0x10: 42, 0x11: 29, 0x12: 56,
+        0x13: 119, 0x14: 58, 0x1B: 1, 0x20: 57, 0x2C: 99,
+        0x21: 104, 0x22: 109, 0x23: 107, 0x24: 102,
+        0x25: 105, 0x26: 103, 0x27: 106, 0x28: 108,
+        0x2D: 110, 0x2E: 111,
+        0x5B: 125, 0x5C: 126, 0x5D: 139,
+        0x90: 69, 0x91: 70,
+        0xA0: 42, 0xA1: 54, 0xA2: 29, 0xA3: 97, 0xA4: 56, 0xA5: 100,
+        0xAD: 113, 0xAE: 115, 0xAF: 114,
+        0xB0: 167, 0xB1: 166, 0xB2: 165, 0xB3: 164,
+        0xBD: 12, 0xBB: 13, 0xDB: 26, 0xDC: 43, 0xDD: 27,
+        0xBA: 39, 0xDE: 40, 0xC0: 41, 0xBC: 51, 0xBE: 52, 0xBF: 53,
+    }
+    for index, code in enumerate([30, 48, 46, 32, 18, 33, 34, 35, 23, 36,
+                                  37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                                  22, 47, 17, 45, 21, 44]):
+        table[0x41 + index] = code
+    table[0x30] = 11
+    for index in range(1, 10):
+        table[0x30 + index] = 1 + index
+    for index in range(12):
+        table[0x70 + index] = 59 + index if index < 10 else (87, 88)[index - 10]
+    for index, code in enumerate([71, 72, 73, 75, 76, 77, 79, 80, 81, 82]):
+        table[0x60 + index] = code
+    table.update({0x6A: 55, 0x6B: 78, 0x6D: 74, 0x6E: 83, 0x6F: 98})
+    return table
+
+
+def _hid_usage_to_evdev():
+    table = {}
+    for index, code in enumerate([30, 48, 46, 32, 18, 33, 34, 35, 23, 36,
+                                  37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                                  22, 47, 17, 45, 21, 44]):
+        table[4 + index] = code
+    for index in range(9):
+        table[0x1E + index] = 2 + index
+    table[0x27] = 11
+    table.update({
+        0x28: 28, 0x29: 1, 0x2A: 14, 0x2B: 15, 0x2C: 57,
+        0x2D: 12, 0x2E: 13, 0x2F: 26, 0x30: 27, 0x31: 43,
+        0x33: 39, 0x34: 40, 0x35: 41, 0x36: 51, 0x37: 52, 0x38: 53,
+        0x39: 58, 0x46: 99, 0x47: 70, 0x48: 119,
+        0x49: 110, 0x4A: 102, 0x4B: 104, 0x4C: 111, 0x4D: 107,
+        0x4E: 109, 0x4F: 106, 0x50: 105, 0x51: 108, 0x52: 103,
+        0x53: 69, 0x54: 98, 0x55: 55, 0x56: 74, 0x57: 78, 0x58: 96,
+        0xE0: 29, 0xE1: 42, 0xE2: 56, 0xE3: 125,
+        0xE4: 97, 0xE5: 54, 0xE6: 100, 0xE7: 126,
+        0x3A: 59, 0x3B: 60, 0x3C: 61, 0x3D: 62, 0x3E: 63, 0x3F: 64,
+        0x40: 65, 0x41: 66, 0x42: 67, 0x43: 68, 0x44: 87, 0x45: 88,
+    })
+    for offset, code in enumerate([71, 72, 73, 75, 76, 77, 79, 80, 81, 82]):
+        table[0x59 + offset] = code
+    return table
+
+
+def _consumer_to_evdev():
+    return {0xE2: 113, 0xE9: 114, 0xEA: 115,
+            0xB0: 167, 0xB5: 166, 0xCD: 164, 0xB7: 165}
+
+
+def build_input_names():
+    """{(evtype, code): name} used by --watch when the kernel header is absent.
+
+    Codes repeat across event types (6 is both KEY_5 and REL_HWHEEL), so the
+    event type is part of the key.
+    """
+    names = {}
+
+    def add(etype, code, name):
+        names[(etype, code)] = name
+
+    for etype, code, name in (
+            (EV_REL, 6, "REL_HWHEEL"), (EV_REL, 7, "REL_DIAL"),
+            (EV_REL, 8, "REL_WHEEL"), (EV_REL, 11, "REL_WHEEL_HI_RES"),
+            (EV_REL, 12, "REL_HWHEEL_HI_RES"),
+            (EV_KEY, 272, "BTN_LEFT"), (EV_KEY, 273, "BTN_RIGHT"),
+            (EV_KEY, 274, "BTN_MIDDLE"),
+            (EV_KEY, 113, "KEY_MUTE"), (EV_KEY, 114, "KEY_VOLUMEUP"),
+            (EV_KEY, 115, "KEY_VOLUMEDOWN"), (EV_KEY, 164, "KEY_PLAYPAUSE"),
+            (EV_KEY, 165, "KEY_STOPCD"), (EV_KEY, 166, "KEY_PREVIOUSSONG"),
+            (EV_KEY, 167, "KEY_NEXTSONG")):
+        add(etype, code, name)
+
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for index, code in enumerate([30, 48, 46, 32, 18, 33, 34, 35, 23, 36,
+                                  37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                                  22, 47, 17, 45, 21, 44]):
+        add(EV_KEY, code, "KEY_" + letters[index])
+    for index in range(9):
+        add(EV_KEY, 2 + index, "KEY_%d" % (index + 1))
+    add(EV_KEY, 11, "KEY_0")
+    for index in range(12):
+        add(EV_KEY, 59 + index if index < 10 else (87, 88)[index - 10],
+            "KEY_F%d" % (index + 1))
+    for code, name in (
+            (1, "KEY_ESC"), (14, "KEY_BACKSPACE"), (15, "KEY_TAB"),
+            (28, "KEY_ENTER"), (29, "KEY_LEFTCTRL"), (42, "KEY_LEFTSHIFT"),
+            (54, "KEY_RIGHTSHIFT"), (56, "KEY_LEFTALT"), (57, "KEY_SPACE"),
+            (58, "KEY_CAPSLOCK"), (97, "KEY_RIGHTCTRL"), (100, "KEY_RIGHTALT"),
+            (102, "KEY_HOME"), (103, "KEY_UP"), (104, "KEY_PAGEUP"),
+            (105, "KEY_LEFT"), (106, "KEY_RIGHT"), (107, "KEY_END"),
+            (108, "KEY_DOWN"), (109, "KEY_PAGEDOWN"), (110, "KEY_INSERT"),
+            (111, "KEY_DELETE"), (125, "KEY_LEFTMETA"), (126, "KEY_RIGHTMETA"),
+            (139, "KEY_MENU"), (99, "KEY_SYSRQ"), (69, "KEY_NUMLOCK"),
+            (70, "KEY_SCROLLLOCK"), (119, "KEY_PAUSE"), (12, "KEY_MINUS"),
+            (13, "KEY_EQUAL"), (26, "KEY_LEFTBRACE"), (27, "KEY_RIGHTBRACE"),
+            (39, "KEY_SEMICOLON"), (40, "KEY_APOSTROPHE"), (41, "KEY_GRAVE"),
+            (43, "KEY_BACKSLASH"), (51, "KEY_COMMA"), (52, "KEY_DOT"),
+            (53, "KEY_SLASH")):
+        add(EV_KEY, code, name)
+    return names
+
+
+VK_TO_EVDEV = _vk_to_evdev()
+HID_USAGE_TO_EVDEV = _hid_usage_to_evdev()
+CONSUMER_TO_EVDEV = _consumer_to_evdev()
+EVDEV_KEY_NAMES = build_input_names()
+
+def load_input_names():
+    """{(evtype, code): name}, preferring the kernel header when present."""
+    names = {}
+    try:
+        lines = open(INPUT_CODES, encoding="utf-8", errors="replace")
+    except OSError:
+        lines = None
+    if lines is not None:
+        pattern = re.compile(r"^\s*#define\s+((?:KEY|BTN|REL|ABS)_[A-Z0-9_]+)\s+(\d+)")
+        with lines:
+            for line in lines:
+                match = pattern.match(line)
+                if match:
+                    name = match.group(1)
+                    etype = (EV_REL if name.startswith("REL_") else
+                             3 if name.startswith("ABS_") else EV_KEY)
+                    names.setdefault((etype, int(match.group(2))), name)
+    for key, name in EVDEV_KEY_NAMES.items():
+        names.setdefault(key, name)
+    return names
+
+
+def event_names(names, etype, code):
+    label = names.get((etype, code))
+    if label is None:
+        label = "0x%03x" % code
+    kind = {EV_KEY: "KEY", EV_REL: "REL", 3: "ABS", 4: "MSC"}.get(
+        etype, "EV%d" % etype)
+    return kind, label
+
+class InputSource:
+    """Reads T1 input events and normalises them to (etype, code, value)."""
+
+    name = "input"
+
+    def wait(self, timeout):
+        """Return the events seen within timeout seconds."""
+        raise NotImplementedError
+
+    def describe(self):
+        return self.name
+
+    def close(self):
+        pass
+
+
+class LinuxInputSource(InputSource):
+    """evdev nodes: the T1 only (scope="t1") or every input node (scope="all")."""
+
+    def __init__(self, scope="all"):
+        self.scope = scope
+        self.fds = open_input_nodes(only_t1=(scope == "t1"))
+        if not self.fds:
+            raise DeviceError("no readable input node")
+        self._t1_flag = {fd: flag for fd, _path, flag in self.fds}
+        self.name = ", ".join(os.path.basename(path) for _fd, path, _f in self.fds)
+
+    def wait(self, timeout):
+        ready, _, _ = select.select([fd for fd, _p, _f in self.fds], [], [], timeout)
+        events = []
+        for fd in ready:
+            is_t1 = self._t1_flag[fd]
+            events.extend([event + (is_t1,) for event in read_events(fd)])
+        return events
+
+    def close(self):
+        for fd, _path, _flag in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds = []
+
+
+class QueueInputSource(InputSource):
+    """Shared helper: events are pushed by a backend thread."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._stop = threading.Event()
+        self.name = "input"
+
+    def _push(self, event):
+        self._queue.put(event)
+
+    def wait(self, timeout):
+        events = []
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            try:
+                events.append(self._queue.get(timeout=max(0.0, deadline - time.time())))
+            except queue.Empty:
+                break
+            if time.time() >= deadline:
+                break
+        return events
+
+    def close(self):
+        self._stop.set()
+
+
+class WindowsInputSource(QueueInputSource):
+    """Raw input (WM_INPUT) filtered to the T1, mapped to evdev codes."""
+
+    RIDEV_INPUTSINK = 0x00000100
+    WM_INPUT = 0x00FF
+    RI_KEY_BREAK = 0x0001
+    RID_INPUT = 1
+    RIDI_DEVICENAME = 1
+
+    def __init__(self, scope="all"):
+        super().__init__()
+        self.scope = scope
+        self.name = "raw-input"
+        self._current_is_t1 = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _push(self, event):
+        super()._push(event + (self._current_is_t1,))
+
+    def _run(self):
+        try:
+            self._message_loop()
+        except Exception:
+            log("windows input backend failed: %s" % sys.exc_info()[1])
+
+    def _message_loop(self):
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._user32 = user32
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint), ("style", ctypes.c_uint),
+                ("lpfnWndProc", ctypes.c_void_p), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+                ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR), ("hIconSm", ctypes.c_void_p),
+            ]
+
+        class RAWINPUTDEVICE(ctypes.Structure):
+            _fields_ = [("wUsagePage", ctypes.c_ushort), ("wUsage", ctypes.c_ushort),
+                        ("dwFlags", ctypes.c_uint), ("hwndTarget", ctypes.c_void_p)]
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
+                                     ctypes.c_wparam, ctypes.c_lparam)
+        user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                          ctypes.c_wparam, ctypes.c_lparam]
+        user32.DefWindowProcW.restype = ctypes.c_long
+
+        def wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_INPUT:
+                self._on_raw_input(user32, wparam, lparam)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wnd_proc = WNDPROC(wnd_proc)
+        wndclass = WNDCLASSEXW()
+        wndclass.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wndclass.lpfnWndProc = ctypes.cast(self._wnd_proc, ctypes.c_void_p)
+        wndclass.lpszClassName = "VRLeftRawInput"
+        if not user32.RegisterClassExW(ctypes.byref(wndclass)):
+            return
+        hwnd = user32.CreateWindowExW(
+            0, wndclass.lpszClassName, "VRLeft", 0, 0, 0, 0, 0,
+            -3, None, None, None)  # HWND_MESSAGE window
+        if not hwnd:
+            return
+        devices = (RAWINPUTDEVICE * 2)(
+            RAWINPUTDEVICE(0x01, 0x06, self.RIDEV_INPUTSINK, hwnd),
+            RAWINPUTDEVICE(0x01, 0x02, self.RIDEV_INPUTSINK, hwnd))
+        if not user32.RegisterRawInputDevices(devices, 2, ctypes.sizeof(RAWINPUTDEVICE)):
+            user32.DestroyWindow(hwnd)
+            return
+        msg = wt.MSG()
+        while not self._stop.is_set():
+            result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if result in (0, -1):
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        user32.DestroyWindow(hwnd)
+
+    def _on_raw_input(self, user32, wparam, lparam):
+        import ctypes.wintypes as wt
+
+        class RAWINPUTHEADER(ctypes.Structure):
+            _fields_ = [("dwType", ctypes.c_uint), ("dwSize", ctypes.c_uint),
+                        ("hDevice", ctypes.c_void_p), ("wParam", ctypes.c_wparam)]
+
+        size = wt.UINT(0)
+        user32.GetRawInputData(lparam, self.RID_INPUT, None, ctypes.byref(size),
+                               ctypes.sizeof(RAWINPUTHEADER))
+        if not size.value:
+            return
+        buf = ctypes.create_string_buffer(size.value)
+        if user32.GetRawInputData(lparam, self.RID_INPUT, buf, ctypes.byref(size),
+                                  ctypes.sizeof(RAWINPUTHEADER)) < 0:
+            return
+        header = ctypes.cast(buf, ctypes.POINTER(RAWINPUTHEADER)).contents
+        is_t1 = self._is_t1_device(user32, header.hDevice)
+        if self.scope == "t1" and not is_t1:
+            return
+        self._current_is_t1 = is_t1
+        body = ctypes.addressof(buf) + ctypes.sizeof(RAWINPUTHEADER)
+        if header.dwType == 0:  # RIM_TYPEKEYBOARD
+            flags = ctypes.c_ushort.from_address(body + 2).value
+            vkey = ctypes.c_ushort.from_address(body + 4).value
+            code = VK_TO_EVDEV.get(vkey)
+            if code is None:
+                return
+            self._push((EV_KEY, code, 0 if flags & self.RI_KEY_BREAK else 1))
+        elif header.dwType == 1:  # RIM_TYPEMOUSE
+            button_flags = ctypes.c_ushort.from_address(body + 4).value
+            button_data = ctypes.c_short.from_address(body + 6).value
+            self._push_mouse(button_flags, button_data)
+
+    def _push_mouse(self, flags, data):
+        for bit, code in ((0x0001, 272), (0x0004, 273), (0x0010, 274)):
+            if flags & bit:
+                self._push((EV_KEY, code, 1))
+            if flags & (bit << 1):
+                self._push((EV_KEY, code, 0))
+        if flags & 0x0400:  # RI_MOUSE_WHEEL
+            self._push((EV_REL, 8, 1 if data > 0 else -1))
+        if flags & 0x0800:  # RI_MOUSE_HWHEEL
+            self._push((EV_REL, 6, 1 if data > 0 else -1))
+
+    def _is_t1_device(self, user32, hdevice):
+        if not hdevice:
+            return False
+        if not hasattr(self, "_t1_devices"):
+            self._t1_devices = {}
+        known = self._t1_devices.get(hdevice)
+        if known is not None:
+            return known
+        import ctypes.wintypes as wt
+
+        length = wt.UINT(0)
+        user32.GetRawInputDeviceInfoW(hdevice, self.RIDI_DEVICENAME, None,
+                                      ctypes.byref(length))
+        if not length.value:
+            return False
+        buf = ctypes.create_string_buffer((length.value + 1) * 2)
+        if user32.GetRawInputDeviceInfoW(hdevice, self.RIDI_DEVICENAME, buf,
+                                         ctypes.byref(length)) < 0:
+            return False
+        path = buf.value.decode("utf-16", "replace").lower()
+        found = "vid_1189" in path and "pid_8890" in path
+        if len(self._t1_devices) < 32:
+            self._t1_devices[hdevice] = found
+        return found
+
+
+class MacInputSource(QueueInputSource):
+    """IOHID input value callbacks mapped to evdev codes."""
+
+    def __init__(self, scope="all"):
+        super().__init__()
+        self.scope = scope
+        self.name = "IOHIDDevice"
+        self._device_cache = {}
+        self._current_is_t1 = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _push(self, event):
+        super()._push(event + (self._current_is_t1,))
+
+    def _device_is_t1(self, device):
+        """VendorID/ProductID lookup for one IOHIDDeviceRef (cached)."""
+        if not device:
+            return False
+        cached = self._device_cache.get(device)
+        if cached is not None:
+            return cached
+        result = False
+        try:
+            iohid = _mac()["iohid"]
+            ok = True
+            for key, expected in (("VendorID", VID), ("ProductID", PID)):
+                prop = iohid.IOHIDDeviceGetProperty(device, _cf_string(key))
+                if not prop:
+                    ok = False
+                    break
+                number = ctypes.c_int(0)
+                if not _mac()["cf"].CFNumberGetValue(prop, 3, ctypes.byref(number)):
+                    ok = False
+                    break
+                _cf_release(prop)
+                if number.value != expected:
+                    ok = False
+                    break
+            result = ok
+        except Exception:
+            result = False
+        if len(self._device_cache) < 64:
+            self._device_cache[device] = result
+        return result
+
+    def _run(self):
+        try:
+            self._register()
+        except Exception:
+            log("macos input backend failed: %s" % sys.exc_info()[1])
+
+    def _register(self):
+
+        libs = _mac()
+        cf, iohid = libs["cf"], libs["iohid"]
+        if not hasattr(iohid, "IOHIDManagerRegisterInputValueCallback"):
+            return
+        manager = iohid.IOHIDManagerCreate(None, 0)
+        if not manager:
+            return
+        match = None
+        if self.scope == "t1":
+            match = _cf_dict([("VendorID", "%d" % VID), ("ProductID", "%d" % PID)])
+        iohid.IOHIDManagerSetDeviceMatching(manager, match)
+        callback_type = ctypes.CFUNCTYPE(
+            None, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+        self._callback = callback_type(self._on_input)
+        iohid.IOHIDManagerRegisterInputValueCallback(manager, self._callback, None)
+        iohid.IOHIDManagerOpen(manager, 0)
+        run_loop = cf.CFRunLoopGetCurrent()
+        mode = None
+        release_mode = True
+        try:
+            mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode").value
+            release_mode = False  # global constant, not ours to release
+        except (ValueError, TypeError):
+            mode = None
+        if not mode:
+            mode = cf.CFStringCreateWithCString(
+                None, b"kCFRunLoopDefaultMode", 0x08000100)
+        iohid.IOHIDManagerScheduleWithRunLoop(manager, run_loop, mode)
+        while not self._stop.is_set():
+            cf.CFRunLoopRunInMode(mode, 0.25, 0)
+        if release_mode:
+            _cf_release(mode)
+
+    def _on_input(self, _context, _result, sender, _value):
+        try:
+            self._current_is_t1 = self._device_is_t1(sender)
+            libs = _mac()
+            iohid = libs["iohid"]
+            usage_page = int(iohid.IOHIDValueGetUsagePage(_value))
+            usage = int(iohid.IOHIDValueGetUsage(_value))
+            number = int(iohid.IOHIDValueGetIntegerValue(_value))
+            if usage_page == 0x07:
+                code = HID_USAGE_TO_EVDEV.get(usage)
+                if code is None:
+                    return
+                self._push((EV_KEY, code, 1 if number else 0))
+            elif usage_page == 0x0C:
+                code = CONSUMER_TO_EVDEV.get(usage)
+                if code is not None:
+                    self._push((EV_KEY, code, 1 if number else 0))
+            elif usage_page == 0x01:
+                if usage == 0x38:  # wheel
+                    self._push((EV_REL, 8, 1 if number > 0 else (-1 if number else 0)))
+                elif usage == 0x36:  # AC pan / horizontal wheel
+                    self._push((EV_REL, 6, 1 if number > 0 else (-1 if number else 0)))
+                elif usage in (0x09, 0x0A, 0x0B):
+                    self._push((EV_KEY, {0x09: 272, 0x0A: 273, 0x0B: 274}[usage],
+                                1 if number else 0))
+        except Exception:
+            pass
+
+def open_input_source(scope="all"):
+    """Best available input source on this platform (None when unavailable)."""
+    try:
+        if IS_WIN:
+            return WindowsInputSource(scope=scope)
+        if IS_MAC:
+            return MacInputSource(scope=scope)
+        return LinuxInputSource(scope=scope)
+    except DeviceError:
+        return None
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# trigger engine: input events -> OSC messages
+# ---------------------------------------------------------------------------
+
+
+def parse_value(osc_type, text):
+    """Convert a GUI/CLI string into the value for an OSC type."""
+    text = str(text).strip()
+    if osc_type == "bool":
+        return text.lower() in ("1", "true", "t", "yes", "on")
+    if osc_type == "int":
+        return int(text, 0)
+    if osc_type == "float":
+        return float(text)
+    return text
+
+
+def format_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return "%g" % value
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+class Engine:
+    """Turns (etype, code, value, is_t1) input events into OSC messages."""
+
+    def __init__(self, settings, sender, emit=None, now=None):
+        self.settings = settings
+        self.sender = sender
+        self.emit = emit or (lambda line: None)
+        self._now = now or time.time
+        self.shift = False
+        self.toggle = {}
+        self.held = set()
+        self.pulses = []
+        self.sent = 0
+        self.skipped = 0
+
+    def refresh(self, settings):
+        """Point the engine at a new settings object (GUI saves in place)."""
+        self.settings = settings
+
+    # -- matching -----------------------------------------------------------
+    def _matches(self, binding, kind, digit=None, code=None, is_t1=False):
+        trigger = binding.get("trigger", {})
+        if trigger.get("kind") != kind:
+            return False
+        if kind == "shift_digit":
+            return trigger.get("digit") == digit
+        if int(trigger.get("code", -1)) != code:
+            return False
+        if trigger.get("device", "t1") == "t1" and not is_t1:
+            return False
+        return True
+
+    def _select(self, kind, **kwargs):
+        for binding in self.settings.get("bindings", []):
+            if not binding.get("enabled", True):
+                continue
+            if self._matches(binding, kind, **kwargs):
+                yield binding
+
+    # -- sending ------------------------------------------------------------
+    def _send(self, address, osc_type, value):
+        if not self.sender.send(address, osc_type, value):
+            self.emit("send failed %s: %s" % (address, self.sender.last_error))
+            return []
+        self.sent += 1
+        self.emit("%s %s = %s" % (address, osc_type, format_value(value)))
+        return [(address, value)]
+
+    def _off_value(self, action):
+        if "off_value" in action:
+            return action["off_value"]
+        osc_type = action.get("type", "bool")
+        if osc_type == "int":
+            return 0
+        if osc_type == "float":
+            return 0.0
+        if osc_type == "string":
+            return ""
+        return False
+
+    def _send_action(self, action, value):
+        address = (action.get("address") or "").strip()
+        if not address:
+            self.skipped += 1
+            return []
+        return self._send(address, action.get("type", "bool"), value)
+
+    def _fire(self, binding):
+        action = binding.get("action", {})
+        mode = action.get("mode", "pulse")
+        binding_id = binding.get("id")
+        if mode == "toggle":
+            state = not self.toggle.get(binding_id, False)
+            self.toggle[binding_id] = state
+            value = action.get("value", True) if state else self._off_value(action)
+            return self._send_action(action, value)
+        if mode == "pulse":
+            sent = self._send_action(action, action.get("value", True))
+            if sent:
+                delay = max(1, int(action.get("pulse_ms", 200))) / 1000.0
+                self.pulses.append((self._now() + delay, binding_id, action))
+            return sent
+        if mode == "hold":
+            if binding_id in self.held:
+                return []
+            self.held.add(binding_id)
+        return self._send_action(action, action.get("value", True))
+
+    def _send_off(self, binding):
+        action = binding.get("action", {})
+        return self._send_action(action, self._off_value(action))
+
+    def _release(self, binding):
+        binding_id = binding.get("id")
+        if binding_id not in self.held:
+            return []
+        self.held.discard(binding_id)
+        return self._send_off(binding)
+
+    # -- events -------------------------------------------------------------
+    def handle(self, event):
+        if len(event) < 3:
+            return []
+        etype, code, value = event[0], event[1], event[2]
+        is_t1 = bool(event[3]) if len(event) > 3 else True
+        if etype != EV_KEY:
+            return []
+        sent = []
+        if code in SHIFT_CODES:
+            if value and not self.shift:
+                self.shift = True
+            elif not value and self.shift:
+                self.shift = False
+                for binding in list(self.held):
+                    held = _id_binding(self.settings, binding)
+                    if held and held.get("trigger", {}).get("kind") == "shift_digit":
+                        sent.extend(self._release(held))
+            return sent
+        if value == 0:
+            for binding in list(self._select("key", code=code, is_t1=is_t1)):
+                sent.extend(self._release(binding))
+            return sent
+        if value != 1:
+            return []  # key repeat
+        if self.shift and self.settings.get("input", {}).get("shift_digits", True):
+            digit = DIGIT_CODES.get(code)
+            if digit is not None:
+                for binding in self._select("shift_digit", digit=digit):
+                    sent.extend(self._fire(binding))
+        for binding in self._select("key", code=code, is_t1=is_t1):
+            sent.extend(self._fire(binding))
+        return sent
+
+    def tick(self):
+        """Fire the release half of finished pulses."""
+        now = self._now()
+        due = [entry for entry in self.pulses if entry[0] <= now]
+        if not due:
+            return []
+        self.pulses = [entry for entry in self.pulses if entry[0] > now]
+        sent = []
+        for _deadline, _binding_id, action in due:
+            sent.extend(self._send_action(action, self._off_value(action)))
+        return sent
+
+
+def _id_binding(settings, binding_id):
+    for binding in settings.get("bindings", []):
+        if binding.get("id") == binding_id:
+            return binding
+    return None
+
+
+# ---------------------------------------------------------------------------
+# monitor loop
+# ---------------------------------------------------------------------------
+
+
+def monitor_scope(settings):
+    """Devices to listen to: everything when Shift+digit is used."""
+    input_cfg = settings.get("input", {})
+    if input_cfg.get("shift_digits", True):
+        return "all"
+    for binding in settings.get("bindings", []):
+        trigger = binding.get("trigger", {})
+        if trigger.get("kind") == "key" and trigger.get("device", "t1") == "any":
+            return "all"
+    return "t1"
+
+
+def monitor_loop(settings, stop_event=None, emit=None, shared=None):
+    """Input events -> engine -> VRChat. Returns when stop_event is set."""
+    stop_event = stop_event or threading.Event()
+    emit = emit or (lambda line: print(line, flush=True))
+    osc = settings.get("osc", {})
+    sender = OscSender(osc.get("host", "127.0.0.1"), int(osc.get("port", 9000)))
+    engine = Engine(settings, sender, emit=emit)
+    if shared is not None:
+        shared["engine"] = engine
+    inbox = queue.Queue()
+    listener = None
+    if osc.get("listen", True):
+        listener = OscListener(int(osc.get("listen_port", 9001)),
+                               lambda address, values: inbox.put((address, values)))
+        if listener.error:
+            emit("listener unavailable: %s" % listener.error)
+            listener = None
+        else:
+            listener.start()
+    scope = monitor_scope(settings)
+    source = open_input_source(scope=scope)
+    if source is None:
+        emit("input source unavailable (scope=%s) - Shift+digit will not fire" % scope)
+    else:
+        emit("input: %s (scope=%s)" % (source.describe(), scope))
+    emit("osc: sending to %s:%s" % (sender.host, sender.port))
+    mtime = _config_mtime()
+    try:
+        while not stop_event.is_set():
+            if source is not None:
+                try:
+                    for event in source.wait(0.15):
+                        engine.handle(event)
+                except (OSError, ValueError) as exc:
+                    emit("input read error: %s" % exc)
+                    stop_event.wait(0.5)
+            engine.tick()
+            while True:
+                try:
+                    address, values = inbox.get_nowait()
+                except queue.Empty:
+                    break
+                emit("recv %s %s" % (address, values))
+            if shared is None:
+                new_mtime = _config_mtime()
+                if new_mtime != mtime:
+                    mtime = new_mtime
+                    fresh = load_settings()
+                    settings.clear()
+                    settings.update(fresh)
+                    engine.refresh(settings)
+                    emit("settings reloaded")
+    finally:
+        if listener is not None:
+            listener.close()
+        if source is not None:
+            source.close()
+        sender.close()
+        if shared is not None:
+            shared.pop("engine", None)
+        emit("monitor stopped")
+
+
+def _config_mtime():
+    try:
+        return os.stat(CONFIG_FILE).st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _pid_alive(pid):
+    if IS_WIN:
+        result = subprocess.run(
+            ["tasklist", "/FI", "PID eq %d" % pid], capture_output=True, text=True)
+        return str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def run_monitor(_argv=None):
+    pid_path = pid_file_path()
+    try:
+        pid = int(open(pid_path, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid and pid != os.getpid() and _pid_alive(pid):
+        log("monitor already running (pid %d)" % pid)
+        return 1
+    write_pid_file()
+    stop = threading.Event()
+
+    def _stop(_signum, _frame):
+        stop.set()
+
+    for signame in ("SIGTERM", "SIGINT"):
+        if hasattr(signal, signame):
+            signal.signal(getattr(signal, signame), _stop)
+    settings = load_settings()
+    log("monitor starting (pid %d)" % os.getpid())
+    try:
+        monitor_loop(settings, stop_event=stop, emit=log)
+    finally:
+        remove_pid_file()
+        log("monitor exiting")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# diagnostics: --watch / --send / --selftest
+# ---------------------------------------------------------------------------
+
+
+def run_watch(seconds=None, scope=None):
+    settings = load_settings()
+    source = open_input_source(scope=scope or monitor_scope(settings))
+    if source is None:
+        print("no readable input node - check permissions / group membership",
+              file=sys.stderr)
+        return 1
+    names = load_input_names()
+    print("watching: %s" % source.describe())
+    print("press a key or click a mouse button (Ctrl-C to stop)")
+    deadline = time.time() + seconds if seconds else None
+    try:
+        while deadline is None or time.time() < deadline:
+            try:
+                events = source.wait(0.5)
+            except (OSError, ValueError):
+                break
+            for event in events:
+                if len(event) < 3:
+                    continue
+                etype, code, value = event[0], event[1], event[2]
+                is_t1 = bool(event[3]) if len(event) > 3 else False
+                if etype == EV_SYN:
+                    continue
+                kind, label = event_names(names, etype, code)
+                if etype == EV_KEY:
+                    state = "down" if value == 1 else ("up" if value == 0 else "repeat")
+                else:
+                    state = "%+d" % value
+                print("  %-12s %-4s %-18s %-7s %s" % (
+                    source.name, kind, label, state, "t1" if is_t1 else ""))
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        source.close()
+    return 0
+
+
+def run_send(address, osc_type, value):
+    settings = load_settings()
+    osc = settings.get("osc", {})
+    if osc_type not in OSC_TYPES:
+        print("type must be one of: %s" % ", ".join(OSC_TYPES), file=sys.stderr)
+        return 1
+    try:
+        parsed = parse_value(osc_type, value)
+    except ValueError as exc:
+        print("bad value %r: %s" % (value, exc), file=sys.stderr)
+        return 1
+    sender = OscSender(osc.get("host", "127.0.0.1"), int(osc.get("port", 9000)))
+    ok = sender.send(address, osc_type, parsed)
+    sender.close()
+    if not ok:
+        print("send failed", file=sys.stderr)
+        return 1
+    print("sent %s %s = %s -> %s:%s" % (
+        address, osc_type, format_value(parsed), osc.get("host"), osc.get("port")))
+    return 0
+
+
+def run_selftest(send_message=False):
+    passed = []
+
+    def check(label, ok, detail=""):
+        passed.append(bool(ok))
+        print("%-26s %-4s %s" % (label, "OK" if ok else "FAIL", detail))
+
+    check("platform", True, "%s / python %s" % (sys.platform, sys.version.split()[0]))
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        writable = os.access(CONFIG_DIR, os.W_OK)
+    except OSError:
+        writable = False
+    check("config file", writable, CONFIG_FILE)
+
+    if IS_LINUX:
+        nodes = list_input_nodes()
+        t1_nodes = [path for path, _name, flag in nodes if flag]
+        check("input nodes readable", bool(nodes),
+              "%d nodes (T1: %s)" % (len(nodes), ",".join(t1_nodes) or "none"))
+    else:
+        source = open_input_source(scope="all")
+        try:
+            check("input source", source is not None,
+                  source.describe() if source else "unavailable")
+        finally:
+            if source is not None:
+                source.close()
+
+    settings = load_settings()
+    shift_keys = [b for b in settings.get("bindings", [])
+                  if b.get("trigger", {}).get("kind") == "shift_digit"]
+    check("shift+digit triggers", len(shift_keys) >= 10, "%d configured" % len(shift_keys))
+    osc = settings.get("osc", {})
+    check("osc target", True, "%s:%s" % (osc.get("host"), osc.get("port")))
+    listener_ok = True
+    detail = "port %s" % osc.get("listen_port")
+    if osc.get("listen", True):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind(("", int(osc.get("listen_port", 9001))))
+        except OSError as exc:
+            listener_ok = False
+            detail = str(exc)
+        finally:
+            probe.close()
+    check("osc listener", listener_ok, detail)
+
+    enabled = [b for b in settings.get("bindings", []) if b.get("enabled", True)]
+    with_address = [b for b in enabled if (b.get("action", {}).get("address") or "").strip()]
+    check("bindings", bool(settings.get("bindings")),
+          "%d configured / %d enabled / %d with address" % (
+              len(settings.get("bindings", [])), len(enabled), len(with_address)))
+
+    if send_message:
+        sender = OscSender(osc.get("host", "127.0.0.1"), int(osc.get("port", 9000)))
+        ok = sender.send("/avatar/parameters/VRLeft_SelfTest", "bool", True)
+        sender.close()
+        check("test message", ok, "/avatar/parameters/VRLeft_SelfTest")
+
+    ok = all(passed)
+    print("\nRESULT: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+
+def run_gui():
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:
+        print("Tkinter is required for the GUI: %s" % exc, file=sys.stderr)
+        print("Install it first (Arch: sudo pacman -S tk / "
+              "Debian: sudo apt install python3-tk / macOS: brew install python-tk)",
+              file=sys.stderr)
+        return 1
+
+    class MainWindow:
+        def __init__(self, root):
+            self.root = root
+            self.settings = load_settings()
+            self.outbox = queue.Queue()
+            self.stop_event = threading.Event()
+            self.shared = {}
+            self.monitor_thread = None
+            self.selected = None
+            root.title("VRLeft %s - keypad to VRChat" % VERSION)
+            root.geometry("860x600")
+            self._build_toolbar()
+            self._build_tabs()
+            self._refresh_tree()
+            root.protocol("WM_DELETE_WINDOW", self.on_close)
+            root.after(150, self._poll)
+
+        # -- layout ---------------------------------------------------------
+        def _build_toolbar(self):
+            bar = ttk.Frame(self.root, padding=(8, 6))
+            bar.pack(fill="x")
+            self.monitor_button = ttk.Button(bar, text="Start monitor",
+                                             command=self.toggle_monitor)
+            self.monitor_button.pack(side="left")
+            ttk.Button(bar, text="Save", command=self.save).pack(side="left", padx=6)
+            ttk.Button(bar, text="Reload", command=self.reload).pack(side="left")
+            self.status_var = tk.StringVar(value="stopped")
+            ttk.Label(bar, textvariable=self.status_var).pack(side="right")
+
+        def _build_tabs(self):
+            self.notebook = ttk.Notebook(self.root)
+            self.notebook.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            self._build_bindings_tab()
+            self._build_osc_tab()
+            self._build_input_tab()
+            self._build_log_tab()
+
+        def _build_bindings_tab(self):
+            frame = ttk.Frame(self.notebook, padding=8)
+            self.notebook.add(frame, text=" Bindings ")
+            columns = ("trigger", "address", "type", "mode", "enabled")
+            self.tree = ttk.Treeview(frame, columns=columns, show="headings",
+                                     height=9, selectmode="browse")
+            headings = {"trigger": ("Trigger", 170), "address": ("OSC address", 260),
+                        "type": ("Type", 70), "mode": ("Mode", 80),
+                        "enabled": ("On", 50)}
+            for column, (title, width) in headings.items():
+                self.tree.heading(column, text=title)
+                self.tree.column(column, width=width, anchor="w")
+            scroll = ttk.Scrollbar(frame, orient="vertical",
+                                   command=self.tree.yview)
+            self.tree.configure(yscrollcommand=scroll.set)
+            self.tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
+            scroll.grid(row=0, column=4, sticky="ns")
+            self.tree.bind("<<TreeviewSelect>>", self._on_select)
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+
+            form = ttk.Frame(frame, padding=(0, 8))
+            form.grid(row=1, column=0, columnspan=5, sticky="ew")
+            self.vars = {}
+            row = ttk.Frame(form)
+            row.pack(fill="x")
+            ttk.Label(row, text="Trigger").pack(side="left")
+            self.vars["kind"] = tk.StringVar()
+            kind_box = ttk.Combobox(row, textvariable=self.vars["kind"], width=12,
+                                    values=("shift_digit", "key"), state="readonly")
+            kind_box.pack(side="left", padx=(4, 12))
+            kind_box.bind("<<ComboboxSelected>>", lambda _e: self._sync_trigger_form())
+            ttk.Label(row, text="Digit").pack(side="left")
+            self.vars["digit"] = tk.StringVar()
+            self.digit_box = ttk.Combobox(row, textvariable=self.vars["digit"],
+                                          width=4, values=("1", "2", "3", "4", "5",
+                                                           "6", "7", "8", "9", "0"))
+            self.digit_box.pack(side="left", padx=(4, 12))
+            ttk.Label(row, text="Key code").pack(side="left")
+            self.vars["code"] = tk.StringVar()
+            self.code_entry = ttk.Entry(row, textvariable=self.vars["code"], width=8)
+            self.code_entry.pack(side="left", padx=(4, 6))
+            ttk.Button(row, text="Detect...", command=self.detect_key).pack(side="left")
+            ttk.Label(row, text="Device").pack(side="left", padx=(12, 4))
+            self.vars["device"] = tk.StringVar()
+            self.device_box = ttk.Combobox(row, textvariable=self.vars["device"],
+                                           width=8, values=("t1", "any"),
+                                           state="readonly")
+            self.device_box.pack(side="left")
+
+            row = ttk.Frame(form)
+            row.pack(fill="x", pady=(6, 0))
+            ttk.Label(row, text="Address").pack(side="left")
+            self.vars["address"] = tk.StringVar()
+            ttk.Entry(row, textvariable=self.vars["address"], width=42).pack(
+                side="left", padx=4, fill="x", expand=True)
+            ttk.Label(row, text="Type").pack(side="left", padx=(8, 0))
+            self.vars["type"] = tk.StringVar()
+            ttk.Combobox(row, textvariable=self.vars["type"], width=7,
+                         values=OSC_TYPES, state="readonly").pack(side="left", padx=4)
+            ttk.Label(row, text="Mode").pack(side="left", padx=(8, 0))
+            self.vars["mode"] = tk.StringVar()
+            mode_box = ttk.Combobox(row, textvariable=self.vars["mode"], width=8,
+                                    values=MODES, state="readonly")
+            mode_box.pack(side="left", padx=4)
+            mode_box.bind("<<ComboboxSelected>>", lambda _e: self._sync_mode_form())
+
+            row = ttk.Frame(form)
+            row.pack(fill="x", pady=(6, 0))
+            ttk.Label(row, text="Value").pack(side="left")
+            self.vars["value"] = tk.StringVar()
+            ttk.Entry(row, textvariable=self.vars["value"], width=14).pack(
+                side="left", padx=4)
+            ttk.Label(row, text="Off value").pack(side="left", padx=(8, 0))
+            self.vars["off_value"] = tk.StringVar()
+            self.off_entry = ttk.Entry(row, textvariable=self.vars["off_value"],
+                                       width=14)
+            self.off_entry.pack(side="left", padx=4)
+            ttk.Label(row, text="Pulse ms").pack(side="left", padx=(8, 0))
+            self.vars["pulse_ms"] = tk.StringVar()
+            self.pulse_entry = ttk.Entry(row, textvariable=self.vars["pulse_ms"],
+                                         width=7)
+            self.pulse_entry.pack(side="left", padx=4)
+            self.vars["enabled"] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(row, text="Enabled",
+                            variable=self.vars["enabled"]).pack(side="left",
+                                                                padx=(12, 0))
+
+            row = ttk.Frame(form)
+            row.pack(fill="x", pady=(8, 0))
+            ttk.Button(row, text="New", command=self.new_binding).pack(side="left")
+            ttk.Button(row, text="Apply", command=self.apply_form).pack(
+                side="left", padx=6)
+            ttk.Button(row, text="Delete", command=self.delete_binding).pack(
+                side="left")
+            ttk.Button(row, text="Send test", command=self.send_test).pack(
+                side="left", padx=6)
+
+        def _build_osc_tab(self):
+            frame = ttk.Frame(self.notebook, padding=12)
+            self.notebook.add(frame, text=" OSC ")
+            self.vars["host"] = tk.StringVar()
+            self.vars["port"] = tk.StringVar()
+            self.vars["listen"] = tk.BooleanVar()
+            self.vars["listen_port"] = tk.StringVar()
+            osc = self.settings.get("osc", {})
+            self.vars["host"].set(str(osc.get("host", "127.0.0.1")))
+            self.vars["port"].set(str(osc.get("port", 9000)))
+            self.vars["listen"].set(bool(osc.get("listen", True)))
+            self.vars["listen_port"].set(str(osc.get("listen_port", 9001)))
+            rows = (("Send to (VRChat input)", "host", 18),
+                    ("Port", "port", 8),
+                    ("Listen for VRChat", None, 0),
+                    ("Listen port", "listen_port", 8))
+            for label, key, width in rows:
+                row = ttk.Frame(frame)
+                row.pack(fill="x", pady=4)
+                ttk.Label(row, text=label, width=26, anchor="w").pack(side="left")
+                if key is None:
+                    ttk.Checkbutton(row, variable=self.vars["listen"]).pack(
+                        side="left")
+                else:
+                    ttk.Entry(row, textvariable=self.vars[key],
+                              width=width).pack(side="left")
+            note = ("VRChat receives OSC on 127.0.0.1:9000 and sends to 9001.\n"
+                    "Keep 'Listen for VRChat' on to see parameter feedback.")
+            ttk.Label(frame, text=note, foreground="#555").pack(anchor="w", pady=10)
+            ttk.Button(frame, text="Send test message", command=self.send_test).pack(
+                anchor="w")
+
+        def _build_input_tab(self):
+            frame = ttk.Frame(self.notebook, padding=12)
+            self.notebook.add(frame, text=" Input ")
+            input_cfg = self.settings.get("input", {})
+            self.vars["scope"] = tk.StringVar(
+                value=input_cfg.get("scope", monitor_scope(self.settings)))
+            self.vars["shift_digits"] = tk.BooleanVar(
+                value=bool(input_cfg.get("shift_digits", True)))
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text="Devices", width=26, anchor="w").pack(side="left")
+            scope_box = ttk.Combobox(row, textvariable=self.vars["scope"], width=8,
+                                     values=("all", "t1"), state="readonly")
+            scope_box.pack(side="left")
+            ttk.Label(frame, text="all = every keyboard (Shift+1..0 works without "
+                                  "the keypad), t1 = only the T1").pack(anchor="w")
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=8)
+            ttk.Checkbutton(frame, text="Enable Shift+1..0 on any keyboard",
+                            variable=self.vars["shift_digits"]).pack(anchor="w")
+            ttk.Label(frame, text="Detected input nodes").pack(anchor="w", pady=(10, 4))
+            self.devices = tk.Listbox(frame, height=8)
+            self.devices.pack(fill="both", expand=True)
+            ttk.Button(frame, text="Refresh devices",
+                       command=self.refresh_devices).pack(anchor="w", pady=6)
+            self.refresh_devices()
+
+        def _build_log_tab(self):
+            frame = ttk.Frame(self.notebook, padding=8)
+            self.notebook.add(frame, text=" Log ")
+            self.log_text = tk.Text(frame, height=18, state="disabled",
+                                    font=("monospace", 10))
+            self.log_text.pack(fill="both", expand=True)
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=(6, 0))
+            ttk.Button(row, text="Clear", command=self.clear_log).pack(side="left")
+
+        # -- bindings list --------------------------------------------------
+        def _refresh_tree(self, keep=None):
+            selected = keep if keep is not None else self.selected
+            self.tree.delete(*self.tree.get_children())
+            for binding in self.settings.get("bindings", []):
+                label = binding_label(binding)
+                action = binding.get("action", {})
+                self.tree.insert("", "end", iid=str(binding.get("id")),
+                                 values=(label, action.get("address", ""),
+                                         action.get("type", "bool"),
+                                         action.get("mode", "pulse"),
+                                         "yes" if binding.get("enabled", True) else "no"))
+            if selected is not None and self.tree.exists(str(selected)):
+                self.tree.selection_set(str(selected))
+                self._on_select()
+
+        def _on_select(self, _event=None):
+            selection = self.tree.selection()
+            if not selection:
+                return
+            try:
+                self.selected = int(selection[0])
+            except ValueError:
+                return
+            binding = _id_binding(self.settings, self.selected)
+            if binding is None:
+                return
+            trigger = binding.get("trigger", {})
+            action = binding.get("action", {})
+            self.vars["kind"].set(trigger.get("kind", "shift_digit"))
+            self.vars["digit"].set(str(trigger.get("digit", 1)))
+            self.vars["code"].set(str(trigger.get("code", "")))
+            self.vars["device"].set(trigger.get("device", "t1"))
+            self.vars["address"].set(str(action.get("address", "")))
+            self.vars["type"].set(action.get("type", "bool"))
+            self.vars["mode"].set(action.get("mode", "pulse"))
+            self.vars["value"].set(format_value(action.get("value", True)))
+            self.vars["off_value"].set(format_value(
+                action.get("off_value", self._default_off(action))))
+            self.vars["pulse_ms"].set(str(action.get("pulse_ms", 200)))
+            self.vars["enabled"].set(bool(binding.get("enabled", True)))
+            self._sync_trigger_form()
+            self._sync_mode_form()
+
+        @staticmethod
+        def _default_off(action):
+            osc_type = action.get("type", "bool")
+            return {"int": 0, "float": 0.0, "string": ""}.get(osc_type, False)
+
+        def _sync_trigger_form(self):
+            kind = self.vars["kind"].get()
+            shift = kind == "shift_digit"
+            state = "readonly" if shift else "disabled"
+            self.digit_box.configure(state=state)
+            self.code_entry.configure(state="disabled" if shift else "normal")
+            self.device_box.configure(state="disabled" if shift else "readonly")
+
+        def _sync_mode_form(self):
+            pulse = self.vars["mode"].get() == "pulse"
+            state = "normal" if pulse else "disabled"
+            self.pulse_entry.configure(state=state)
+
+        def apply_form(self):
+            binding = _id_binding(self.settings, self.selected)
+            if binding is None:
+                messagebox.showwarning("VRLeft", "Select a binding first")
+                return
+            action = binding.setdefault("action", {})
+            try:
+                osc_type = self.vars["type"].get()
+                value = parse_value(osc_type, self.vars["value"].get())
+                off_value = parse_value(osc_type, self.vars["off_value"].get())
+                pulse_ms = int(self.vars["pulse_ms"].get() or 200)
+            except ValueError as exc:
+                messagebox.showerror("VRLeft", "Bad value: %s" % exc)
+                return
+            kind = self.vars["kind"].get()
+            trigger = binding.setdefault("trigger", {})
+            trigger["kind"] = kind
+            if kind == "shift_digit":
+                trigger["digit"] = int(self.vars["digit"].get())
+                trigger.pop("code", None)
+                trigger.pop("device", None)
+            else:
+                trigger["code"] = int(self.vars["code"].get())
+                trigger["device"] = self.vars["device"].get() or "any"
+                trigger.pop("digit", None)
+            action["address"] = self.vars["address"].get().strip()
+            action["type"] = osc_type
+            action["value"] = value
+            action["off_value"] = off_value
+            action["mode"] = self.vars["mode"].get()
+            action["pulse_ms"] = pulse_ms
+            binding["enabled"] = bool(self.vars["enabled"].get())
+            self._refresh_tree(keep=self.selected)
+            self.save(refresh=False)
+
+        def new_binding(self):
+            kind = self.vars["kind"].get() or "shift_digit"
+            if kind == "shift_digit":
+                digits = {b.get("trigger", {}).get("digit")
+                          for b in self.settings.get("bindings", [])
+                          if b.get("trigger", {}).get("kind") == "shift_digit"}
+                digit = next((d for d in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
+                              if d not in digits), 1)
+                trigger = {"kind": "shift_digit", "digit": digit}
+            else:
+                trigger = {"kind": "key", "code": 0, "device": "any"}
+            binding = new_binding(self.settings, trigger)
+            self.selected = binding["id"]
+            self._refresh_tree(keep=self.selected)
+            self._on_select()
+            self.save(refresh=False)
+
+        def delete_binding(self):
+            if self.selected is None:
+                return
+            if not messagebox.askyesno("VRLeft", "Delete this binding?"):
+                return
+            self.settings["bindings"] = [
+                b for b in self.settings.get("bindings", [])
+                if b.get("id") != self.selected]
+            self.selected = None
+            self._refresh_tree()
+            self.save(refresh=False)
+
+        # -- actions --------------------------------------------------------
+        def save(self, refresh=True):
+            try:
+                save_settings(self.settings)
+            except OSError as exc:
+                messagebox.showerror("VRLeft", "Save failed: %s" % exc)
+                return
+            engine = self.shared.get("engine")
+            if engine is not None:
+                engine.refresh(self.settings)
+            if refresh:
+                self.status_var.set("saved %s" % time.strftime("%H:%M:%S"))
+
+        def reload(self):
+            self.settings = load_settings()
+            self.selected = None
+            self._refresh_tree()
+            engine = self.shared.get("engine")
+            if engine is not None:
+                engine.refresh(self.settings)
+            self.status_var.set("reloaded")
+
+        def send_test(self):
+            osc = self.settings.get("osc", {})
+            sender = OscSender(osc.get("host", "127.0.0.1"), int(osc.get("port", 9000)))
+            ok = sender.send("/avatar/parameters/VRLeft_SelfTest", "bool", True)
+            error = sender.last_error
+            sender.close()
+            if ok:
+                self.outbox.put("test message sent "
+                                "(/avatar/parameters/VRLeft_SelfTest = true)")
+            else:
+                self.outbox.put("test message failed: %s" % error)
+
+        def refresh_devices(self):
+            self.devices.delete(0, "end")
+            if not IS_LINUX:
+                self.devices.insert("end", "(device list is Linux only)")
+                return
+            nodes = list_input_nodes()
+            if not nodes:
+                self.devices.insert("end", "(no readable input nodes - check "
+                                           "permissions)")
+            for path, name, is_t1 in nodes:
+                self.devices.insert(
+                    "end", "%s  %s  %s" % (path, name, "[T1]" if is_t1 else ""))
+
+        def detect_key(self):
+            scope = self.vars["scope"].get() or monitor_scope(self.settings)
+            window = tk.Toplevel(self.root)
+            window.title("Detect key")
+            window.transient(self.root)
+            window.grab_set()
+            message = tk.StringVar(value="Press a key on the target device (5s)")
+            ttk.Label(window, textvariable=message, padding=16).pack()
+            source = open_input_source(scope=scope)
+            if source is None:
+                message.set("No input source available")
+            deadline = time.time() + 5.0
+
+            def poll():
+                if source is not None:
+                    for event in source.wait(0.05):
+                        if len(event) < 3:
+                            continue
+                        etype, code, value = event[0], event[1], event[2]
+                        is_t1 = bool(event[3]) if len(event) > 3 else False
+                        if etype == EV_KEY and value == 1 and code not in SHIFT_CODES:
+                            self.vars["kind"].set("key")
+                            self.vars["code"].set(str(code))
+                            self.vars["device"].set("t1" if is_t1 else "any")
+                            self._sync_trigger_form()
+                            if source is not None:
+                                source.close()
+                            window.destroy()
+                            return
+                if time.time() >= deadline:
+                    if source is not None:
+                        source.close()
+                    window.destroy()
+                    return
+                window.after(40, poll)
+
+            window.after(40, poll)
+
+        def toggle_monitor(self):
+            if self.monitor_thread is not None and self.monitor_thread.is_alive():
+                self.stop_event.set()
+                self.monitor_button.configure(text="Start monitor")
+                return
+            self.stop_event = threading.Event()
+            self.save(refresh=False)
+            settings = self.settings
+
+            def emit(line):
+                self.outbox.put(line)
+
+            def target():
+                monitor_loop(settings, stop_event=self.stop_event, emit=emit,
+                             shared=self.shared)
+
+            self.monitor_thread = threading.Thread(target=target, daemon=True)
+            self.monitor_thread.start()
+            self.monitor_button.configure(text="Stop monitor")
+
+        def clear_log(self):
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+
+        def _poll(self):
+            drained = 0
+            while drained < 50:
+                try:
+                    line = self.outbox.get_nowait()
+                except queue.Empty:
+                    break
+                drained += 1
+                self.log_text.configure(state="normal")
+                self.log_text.insert("end", line + "\n")
+                self.log_text.see("end")
+                self.log_text.configure(state="disabled")
+            engine = self.shared.get("engine")
+            if engine is not None:
+                self.status_var.set(
+                    "monitor on - %d sent, %d skipped" % (engine.sent, engine.skipped))
+            elif self.status_var.get().startswith("monitor on"):
+                self.status_var.set("stopped")
+            self.root.after(150, self._poll)
+
+        def on_close(self):
+            self.stop_event.set()
+            self.root.destroy()
+
+    root = tk.Tk()
+    MainWindow(root)
+    if os.environ.get("VRLEFT_GUI_SMOKE"):
+        root.update_idletasks()
+        root.update()
+        root.destroy()
+        return 0
+    root.mainloop()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="VRLeft",
+        description="Trigger VRChat avatar parameters from a keypad "
+                    "(T1 mini keyboard or Shift+1..0).")
+    parser.add_argument("--version", action="store_true",
+                        help="print the version and exit")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--gui", action="store_true", help="open the settings GUI")
+    group.add_argument("--monitor", action="store_true",
+                       help="run the input -> OSC monitor in the foreground")
+    group.add_argument("--watch", nargs="?", const=0, type=int, default=None,
+                       metavar="SECONDS", help="print incoming input events")
+    group.add_argument("--selftest", action="store_true",
+                       help="check configuration and hardware, then exit")
+    parser.add_argument("--send", nargs=3, metavar=("ADDRESS", "TYPE", "VALUE"),
+                        help="send one OSC message and exit")
+    parser.add_argument("--scope", choices=("all", "t1"), default=None,
+                        help="input device scope for --watch")
+    parser.add_argument("--send-test", action="store_true",
+                        help="with --selftest: send a test message to VRChat")
+    args = parser.parse_args(argv)
+
+    if args.version:
+        print(VERSION)
+        return 0
+    if args.send:
+        return run_send(*args.send)
+    if args.selftest:
+        return run_selftest(send_message=args.send_test)
+    if args.watch is not None:
+        return run_watch(seconds=args.watch or None, scope=args.scope)
+    if args.monitor:
+        return run_monitor()
+    if args.gui:
+        return run_gui()
+    try:
+        import tkinter  # noqa: F401
+    except Exception:
+        return run_monitor()
+    return run_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

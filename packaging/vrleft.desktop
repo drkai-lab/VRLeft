@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=VRLeft
+Name[ja]=VRLeft (ぶいあーるれふと)
+Exec=VRLeft
+Terminal=false
+Type=Application
+Categories=Game;Utility;
+Keywords=vrchat;osc;keypad;avatar;t1;
+Comment=Trigger VRChat avatar expressions from a keypad
+Comment[ja]=キーパッドでVRChatの表情・ギミックを発動

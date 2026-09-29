@@ -1,0 +1,134 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux (lint, tests, tarball)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tooling
+        run: pip install ruff
+      - name: Lint
+        run: |
+          ruff check .
+          ruff check VRLeft --select F,E9
+      - name: Tests
+        run: |
+          python3 tests/test_osc.py
+          python3 tests/test_core.py
+      - name: CLI smoke test
+        run: |
+          ./VRLeft --version
+          ./VRLeft --help > /dev/null
+      - name: Self test (informational, no VRChat on a runner)
+        run: ./VRLeft --selftest || true
+      - name: Tarball
+        run: |
+          mkdir -p dist
+          tar czf dist/vrleft-linux-x86_64.tar.gz \
+            VRLeft README.md README.ja.md LICENSE install.sh uninstall.sh \
+            60-vrleft-input.rules packaging ruff.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: dist/vrleft-linux-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Tests
+        run: |
+          python3 tests/test_osc.py
+          python3 tests/test_core.py
+      - name: Build console exe
+        run: pyinstaller --noconfirm --onefile --name VRLeft --distpath dist-win VRLeft
+      - name: Build windowed (GUI) exe
+        run: pyinstaller --noconfirm --onefile --windowed --name VRLeft-gui --distpath dist-win VRLeft
+      - name: Launch smoke test
+        run: |
+          ./dist-win/VRLeft.exe --version
+          ./dist-win/VRLeft.exe --help > /dev/null
+          ./dist-win/VRLeft-gui.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist-win/*.exe
+          if-no-files-found: error
+
+  macos:
+    name: macos (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Tests
+        run: |
+          python3 tests/test_osc.py
+          python3 tests/test_core.py
+      - name: Build the .app bundle
+        run: pyinstaller --noconfirm --onedir --windowed --name "VRLeft" --distpath dist-mac VRLeft
+      - name: Build the CLI binary
+        run: pyinstaller --noconfirm --onefile --name VRLeft-cli --distpath dist-mac VRLeft
+      - name: Launch smoke test
+        run: |
+          ./dist-mac/VRLeft-cli --version
+          "./dist-mac/VRLeft.app/Contents/MacOS/VRLeft" --version
+      - name: Package the .app (symlink preserving)
+        run: |
+          ditto -c -k --keepParent "dist-mac/VRLeft.app" \
+            "dist-mac/VRLeft-${{ matrix.arch }}.app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist-mac/*.app.zip
+            dist-mac/VRLeft-cli
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to the release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes out/*
