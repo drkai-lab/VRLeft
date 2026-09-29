@@ -132,8 +132,10 @@ class SocketTest(unittest.TestCase):
         self.assertEqual(got, [("/avatar/parameters/Ping", [("s", "hello")])])
 
     def test_listener_reports_a_bind_error(self):
+        # Same wildcard address on both sockets: every platform reports the
+        # conflict (Windows only refuses *overlapping* binds reliably).
         blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        blocker.bind(("127.0.0.1", 0))
+        blocker.bind(("", 0))
         port = blocker.getsockname()[1]
         try:
             listener = vrleft.OscListener(port, lambda *_: None)
