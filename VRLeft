@@ -1217,6 +1217,13 @@ def monitor_loop(settings, stop_event=None, emit=None, shared=None):
         emit("input source unavailable (scope=%s) - Shift+digit will not fire" % scope)
     else:
         emit("input: %s (scope=%s)" % (source.describe(), scope))
+        if IS_LINUX and scope == "all":
+            available = len(list_input_nodes())
+            opened = len(getattr(source, "fds", None) or [])
+            if 0 < opened < available:
+                emit("only %d of %d input nodes are readable - run "
+                     "./install.sh --input-group for Shift+1..0 on every "
+                     "keyboard" % (opened, available))
     emit("osc: sending to %s:%s" % (sender.host, sender.port))
     mtime = _config_mtime()
     try:
