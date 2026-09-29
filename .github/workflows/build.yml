@@ -50,6 +50,9 @@ jobs:
   windows:
     name: windows (.exe)
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

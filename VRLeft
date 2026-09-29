@@ -208,7 +208,8 @@ class OscListener(threading.Thread):
         self.port = int(port)
         self.callback = callback
         self.error = None
-        self._stop = threading.Event()
+        # Thread._stop is a method used by join(); never shadow it.
+        self._stop_event = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.settimeout(0.3)
         try:
@@ -220,7 +221,7 @@ class OscListener(threading.Thread):
     def run(self):
         if getattr(self._sock, "fileno", lambda: -1)() < 0:
             return
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 data, _addr = self._sock.recvfrom(65535)
             except socket.timeout:
@@ -237,7 +238,7 @@ class OscListener(threading.Thread):
                 pass
 
     def close(self):
-        self._stop.set()
+        self._stop_event.set()
         try:
             self._sock.close()
         except OSError:
